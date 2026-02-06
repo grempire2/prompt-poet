@@ -204,6 +204,66 @@ To maintain DRY principles in your templates, break them down into reusable sect
 {% include 'sections/reply_prompt.yml.j2' %}
 ```
 
+#### Nested Sections for Token Statistics
+For detailed monitoring of token usage within different content components, you can use nested sections. This is useful when you need granular statistics about which parts of your prompt are consuming tokens (e.g., character definition vs. safety rules vs. conversation style).
+
+```yaml
+- name: system_instructions
+  role: system
+  sections:
+    - name: character_intro
+      content: |
+        Your name is {{ character_name }} and you are a helpful assistant.
+    - name: safety_rules
+      content: |
+        Never be harmful to humans. Always be respectful and kind.
+    - name: conversation_style
+      content: |
+        Keep your responses concise and engaging.
+```
+
+You can then access detailed statistics:
+
+```python
+prompt = Prompt(raw_template=raw_template, template_data=template_data)
+prompt.tokenize()
+
+# Get hierarchical statistics
+stats = prompt.section_stats
+print(stats)
+>>> [
+    {
+        "part_name": "system_instructions",
+        "part_tokens": 150,
+        "part_role": "system",
+        "has_sections": True,
+        "sections": [
+            {"section_name": "character_intro", "section_tokens": 50},
+            {"section_name": "safety_rules", "section_tokens": 60},
+            {"section_name": "conversation_style", "section_tokens": 40}
+        ]
+    }
+]
+
+# Or get a flat mapping of token counts
+counts = prompt.get_section_token_counts()
+print(counts)
+>>> {
+    "system_instructions": {
+        "character_intro": 50,
+        "safety_rules": 60,
+        "conversation_style": 40
+    }
+}
+```
+
+**Important Notes:**
+- Parts can have **either** `content` OR `sections`, not both
+- Sections use YAML block scalars (`|`) to preserve newlines for proper separation when concatenated
+- Section contents are automatically concatenated to form the part's content
+- Token counts for individual sections may not sum exactly to the part's token count due to tokenization boundary effects
+- This feature is fully backward compatible – existing templates without sections work unchanged
+
 ### Design Choices
 
 #### Prompt Poet Library

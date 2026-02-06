@@ -19,6 +19,20 @@ from typing import Callable
 SPACE_MARKER = "<|space|>"
 
 @dataclass
+class PromptSection:
+    """Container representing a section within a prompt part."""
+
+    name: str
+    """A clear, human-readable identifier for the section."""
+    content: str
+    """The actual string payload that forms this section."""
+    tokens: list[int] | None = None
+    """The tokenized encoding of the section content."""
+    truncation_priority: int | None = None
+    """Optional section-level truncation priority (inherits from part if None)."""
+
+
+@dataclass
 class PromptPart:
     """Container representing repeated prompt parts from the template."""
 
@@ -34,6 +48,8 @@ class PromptPart:
     """The tokenized encoding of the content."""
     truncation_priority: int = 0
     """Determines the order of truncation when necessary."""
+    sections: list[PromptSection] | None = None
+    """Optional list of sections within this part for granular token tracking."""
 
 
 @dataclass
@@ -320,6 +336,74 @@ class Prompt:
 
         return logging.getLogger(__name__)
 
+    @property
+    def section_stats(self) -> list[dict]:
+        """Get hierarchical statistics for parts and their sections.
+
+        Returns:
+            List of dicts with structure:
+            [
+                {
+                    "part_name": "system_instructions",
+                    "part_tokens": 150,
+                    "part_role": "system",
+                    "has_sections": True,
+                    "sections": [
+                        {"section_name": "character_intro", "section_tokens": 100},
+                        {"section_name": "safety_rules", "section_tokens": 50}
+                    ]
+                }
+            ]
+        """
+        if not self._parts:
+            return []
+
+        stats = []
+        for part in self._parts:
+            part_stat = {
+                "part_name": part.name,
+                "part_tokens": len(part.tokens) if part.tokens else 0,
+                "part_role": part.role,
+                "has_sections": bool(part.sections),
+                "sections": []
+            }
+
+            if part.sections:
+                for section in part.sections:
+                    section_stat = {
+                        "section_name": section.name,
+                        "section_tokens": len(section.tokens) if section.tokens else 0,
+                    }
+                    part_stat["sections"].append(section_stat)
+
+            stats.append(part_stat)
+
+        return stats
+
+    def get_section_token_counts(self) -> dict[str, dict[str, int]]:
+        """Get flat mapping of part -> section -> token count.
+
+        Returns:
+            {
+                "system_instructions": {"character_intro": 100, "safety_rules": 50},
+                "user_query": {"_part_total": 25}  # Parts without sections
+            }
+        """
+        result = {}
+        for part in self._parts:
+            if not part.tokens:
+                continue
+
+            if part.sections:
+                result[part.name] = {
+                    section.name: len(section.tokens) if section.tokens else 0
+                    for section in part.sections
+                }
+            else:
+                result[part.name] = {"_part_total": len(part.tokens)}
+
+        return result
+
     def _truncate(
         self, truncation_blocks: list[TruncationBlock], num_tokens_to_truncate: int
     ):
@@ -432,6 +516,44 @@ class Prompt:
         part.tokens = self._encode_func(part.content)
         self._total_tokens += len(part.tokens)
 
+        if part.sections:
+            self._tokenize_sections(part)
+
+    def _tokenize_sections(self, part: PromptPart):
+        """Tokenize individual sections within a part.
+
+        Note: Sum of section tokens may not equal part tokens due to
+        tokenization boundary effects when strings are concatenated.
+
+        Args:
+            part: PromptPart with sections to tokenize
+        """
+        if not part.sections:
+            return
+
+        for section in part.sections:
+            # Skip if section already has tokens
+            if section.tokens is not None:
+                if not self._allow_token_overrides:
+                    raise ValueError(
+                        f"Section '{section.name}' has tokens but token overrides not allowed."
+                    )
+                continue
+
+            # Tokenize section content
+            section.tokens = self._encode_func(section.content)
+
+        # Log token count mismatch (informational)
+        if all(s.tokens is not None for s in part.sections):
+            section_token_sum = sum(len(s.tokens) for s in part.sections)
+            part_token_count = len(part.tokens)
+
+            if section_token_sum != part_token_count:
+                self.logger.debug(
+                    f"Part '{part.name}' token mismatch: part={part_token_count}, "
+                    f"sections_sum={section_token_sum} (expected due to tokenization boundaries)"
+                )
+
     def _load_special_template_data(self):
         """Load special data into the template context."""
         if "token_limit" in self._template_data:
@@ -454,6 +576,70 @@ class Prompt:
                     cai_functions[name] = obj
             self._template_data.update(cai_functions)
 
+    def _create_part_from_sections(self, yaml_part: dict) -> PromptPart:
+        """Create a PromptPart from a YAML part with sections field.
+
+        Args:
+            yaml_part: Dict containing 'sections' field and optional part-level fields
+
+        Returns:
+            PromptPart with concatenated content and section metadata
+
+        Raises:
+            ValueError: If validation fails
+        """
+        sections_data = yaml_part.get('sections', [])
+
+        # Validation
+        if not sections_data:
+            raise ValueError(f"Part '{yaml_part.get('name', 'unknown')}' has empty sections field.")
+        if not isinstance(sections_data, list):
+            raise ValueError(f"Part '{yaml_part.get('name', 'unknown')}' sections must be a list.")
+        if 'content' in yaml_part:
+            raise ValueError(f"Part '{yaml_part.get('name')}' cannot have both 'content' and 'sections'.")
+
+        for idx, section in enumerate(sections_data):
+            if not isinstance(section, dict):
+                raise ValueError(f"Section {idx} must be a dict.")
+            if 'name' not in section:
+                raise ValueError(f"Section {idx} missing 'name' field.")
+            if 'content' not in section:
+                raise ValueError(f"Section {idx} missing 'content' field.")
+
+        # Build sections and concatenated content
+        sections = []
+        content_parts = []
+
+        for idx, section_data in enumerate(sections_data):
+            # Apply cleanup to section content
+            # Note: Unlike regular content, we preserve trailing newlines from sections
+            # to maintain proper separation when concatenating
+            section_content = section_data['content']
+            if isinstance(section_content, str):
+                # Strip leading whitespace and trailing spaces/tabs, but preserve trailing newlines
+                section_content = section_content.lstrip().rstrip(' \t').replace(self._space_marker, " ")
+                section_content = self._unescape_special_characters(section_content)
+
+            section = PromptSection(
+                name=section_data['name'],
+                content=section_content,
+                tokens=section_data.get('tokens'),
+                truncation_priority=section_data.get('truncation_priority'),
+            )
+            sections.append(section)
+            content_parts.append(section_content)
+
+        # Build the part - concatenate sections and apply final cleanup
+        full_content = ''.join(content_parts)
+        # Strip only the final trailing whitespace to match regular content behavior
+        if isinstance(full_content, str):
+            full_content = full_content.strip()
+        part_kwargs = {k: v for k, v in yaml_part.items() if k not in ('sections', 'content')}
+        part_kwargs['content'] = full_content
+        part_kwargs['sections'] = sections
+
+        return PromptPart(**part_kwargs)
+
     def _render_parts(self):
         self._rendered_template = self._template.render_template(self._template_data)
         loaded_yaml = yaml.load(self._rendered_template, Loader=yaml.CSafeLoader)
@@ -461,13 +647,21 @@ class Prompt:
         # TODO: Process parts in parallel for speedup.
         self._parts = [None] * len(loaded_yaml)
         for idx, yaml_part in enumerate(loaded_yaml):
-            part = PromptPart(**yaml_part)
+            if 'sections' in yaml_part:
+                part = self._create_part_from_sections(yaml_part)
+            else:
+                part = PromptPart(**yaml_part)
+
             if not self._allow_token_overrides and part.tokens is not None:
                 raise ValueError(
                     "Token encoding is not allowed to be set in the template."
                 )
             self._validate_template_replacements(part)
-            self._cleanup_content(part)
+
+            # Only cleanup content for parts without sections (sections handle their own cleanup)
+            if not part.sections:
+                self._cleanup_content(part)
+
             self._parts[idx] = part
 
             # Tokens were passed in the yaml; ensure we track them.
