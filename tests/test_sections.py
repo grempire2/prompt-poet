@@ -528,3 +528,25 @@ class TestIntegration:
         prompt = Prompt(raw_template=raw_template, template_data={})
 
         assert prompt.string == "HelloWorld"
+
+    def test_sections_with_new_lines(self):
+        """Test that sections can have extra newlines for spacing."""
+        raw_template = """
+- name: test_part
+  sections:
+    - name: section1
+      content: |+
+        Hello
+
+    - name: section2
+      content: >-
+
+        World
+"""
+        prompt = Prompt(raw_template=raw_template, template_data={})
+
+        # Verify sections preserve newlines
+        assert prompt.parts[0].sections[0].content == "Hello\n\n"
+        assert prompt.parts[0].sections[1].content == "\nWorld"
+        # Concatenated content maintains newline structure
+        assert prompt.string == "Hello\n\n\nWorld"

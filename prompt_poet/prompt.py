@@ -612,12 +612,12 @@ class Prompt:
 
         for idx, section_data in enumerate(sections_data):
             # Apply cleanup to section content
-            # Note: Unlike regular content, we preserve trailing newlines from sections
+            # Note: Unlike regular content, we preserve newlines from sections
             # to maintain proper separation when concatenating
             section_content = section_data['content']
             if isinstance(section_content, str):
-                # Strip leading whitespace and trailing spaces/tabs, but preserve trailing newlines
-                section_content = section_content.lstrip().rstrip(' \t').replace(self._space_marker, " ")
+                # Strip only spaces/tabs (not newlines) to preserve intentional line breaks
+                section_content = section_content.lstrip(' \t').rstrip(' \t').replace(self._space_marker, " ")
                 section_content = self._unescape_special_characters(section_content)
 
             section = PromptSection(
